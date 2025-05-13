@@ -1,0 +1,143 @@
+# --- Struct to hold a sale record ---
+STRUCT Sale
+  store_id: STRING
+  product_id: STRING
+  timestamp: STRING
+  quantity: NUMBER
+  unit_price: NUMBER
+ENDSTRUCT
+
+# --- Class to manage the sales batch processing ---
+CLASS SaleBatch
+  FUNCTION __init__(self)
+    self.raw_sales = []
+    self.valid_sales = []
+    self.duplicates_removed = 0
+    self.suspicious_sales_flagged = 0
+  ENDFUNCTION
+
+  # --- Fetch sales with retry logic ---
+  FUNCTION fetch_sales(self)
+    LET retries = 0
+    LET sales_data = []
+    LOOP WHILE retries < 3
+      TRY
+        LET response = HTTP_GET("https://acme.mock.api/sales")
+        IF response == NULL OR LENGTH(response) == 0 THEN
+          RAISE_ERROR("Empty or invalid response", "DataError", 100)
+        ENDIF
+        sales_data = response
+        BREAK
+      CATCH error
+        CALL LOG("Fetch attempt " + retries + " failed: " + error.MESSAGE)
+        CALL SLEEP(500 * (2 ^ retries))  # Exponential backoff
+        retries = retries + 1
+      ENDTRY
+    ENDLOOP
+    self.raw_sales = sales_data
+  ENDFUNCTION
+
+  # --- Validate and clean each sale ---
+  FUNCTION clean_sales(self)
+    LET seen_keys = []
+
+    LOOP FOR sale IN self.raw_sales
+      # Skip if any field missing
+      IF NOT (sale.CONTAINS("store_id") AND sale.CONTAINS("product_id") AND sale.CONTAINS("timestamp") AND sale.CONTAINS("quantity") AND sale.CONTAINS("unit_price")) THEN
+        CONTINUE
+      ENDIF
+
+      # Parse and validate quantity and price
+      LET qty = sale["quantity"]
+      LET price = sale["unit_price"]
+      IF TYPE(qty) != "NUMBER" OR qty <= 0 THEN
+        CONTINUE
+      ENDIF
+      IF TYPE(price) != "NUMBER" OR price < 0 THEN
+        CONTINUE
+      ENDIF
+
+      # Suspicious check
+      IF qty * price > 10000 THEN
+        self.suspicious_sales_flagged = self.suspicious_sales_flagged + 1
+        CONTINUE
+      ENDIF
+
+      # Duplicate check (store_id + product_id + timestamp ±2 sec)
+      LET key = sale["store_id"] + "_" + sale["product_id"]
+      LET ts = DATE_PARSE(sale["timestamp"])
+      LET is_duplicate = FALSE
+
+      LOOP FOR existing IN seen_keys
+        IF key == existing["key"] THEN
+          LET diff = ABS(DATE_DIFF(ts, existing["timestamp"], "SECONDS"))
+          IF diff <= 2 THEN
+            is_duplicate = TRUE
+            BREAK
+          ENDIF
+        ENDIF
+      ENDLOOP
+
+      IF is_duplicate THEN
+        self.duplicates_removed = self.duplicates_removed + 1
+        CONTINUE
+      ENDIF
+
+      # Add to seen_keys
+      CALL seen_keys.APPEND({ "key": key, "timestamp": ts })
+
+      # Add to valid sales
+      LET s = Sale {
+        store_id: sale["store_id"],
+        product_id: sale["product_id"],
+        timestamp: sale["timestamp"],
+        quantity: qty,
+        unit_price: price
+      }
+      CALL self.valid_sales.APPEND(s)
+    ENDLOOP
+  ENDFUNCTION
+
+  # --- Summarize total sales amount per product ---
+  FUNCTION summarize_sales(self)
+    LET totals = {}  # MAP of product_id -> total_amount
+
+    LOOP FOR sale IN self.valid_sales
+      LET pid = sale.product_id
+      LET amt = sale.quantity * sale.unit_price
+
+      IF totals.CONTAINS(pid) THEN
+        totals[pid] = totals[pid] + amt
+      ELSE
+        totals[pid] = amt
+      ENDIF
+    ENDLOOP
+
+    # Convert to list and sort descending by amount
+    LET summary_list = []
+    LOOP FOR pid IN totals.KEYS()
+      CALL summary_list.APPEND({ "product_id": pid, "total": totals[pid] })
+    ENDLOOP
+    CALL summary_list.SORT(order="DESC", key="total")
+
+    # Output top 5
+    PRINT("Top 5 Products by Sales:")
+    LOOP FOR INDEX i IN 0 TO MIN(4, LENGTH(summary_list) - 1)
+      LET item = summary_list[i]
+      PRINT(item["product_id"] + ": " + item["total"])
+    ENDLOOP
+  ENDFUNCTION
+
+  FUNCTION output_metrics(self)
+    PRINT("Valid sales count: " + LENGTH(self.valid_sales))
+    PRINT("Duplicates removed: " + self.duplicates_removed)
+    PRINT("Suspicious sales flagged: " + self.suspicious_sales_flagged)
+  ENDFUNCTION
+ENDCLASS
+
+# --- MAIN EXECUTION ---
+LET batch = NEW SaleBatch()
+CALL batch.fetch_sales()
+CALL batch.clean_sales()
+CALL batch.summarize_sales()
+CALL batch.output_metrics()

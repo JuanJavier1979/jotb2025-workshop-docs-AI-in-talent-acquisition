@@ -1,0 +1,125 @@
+STRUCT Sale
+  store_id: STRING
+  product_id: STRING
+  timestamp: STRING
+  quantity: NUMBER
+  unit_price: NUMBER
+ENDSTRUCT
+
+CLASS SaleBatch
+  FUNCTION __init__(self)
+    self.sales = []
+    self.valid_sales = []
+    self.duplicate_count = 0
+    self.suspicious_count = 0
+  ENDFUNCTION
+
+  FUNCTION fetch_sales(self)
+    LET retries = 0
+    LET backoffs = [500, 1000, 2000]
+
+    LOOP WHILE retries < 3
+      TRY
+        LET raw_data = HTTP_GET("https://acme.mock.api/sales")
+        IF LENGTH(raw_data) == 0 THEN
+          CALL LOG("Empty response.")
+          SLEEP(backoffs[retries])
+          retries = retries + 1
+          CONTINUE
+        ENDIF
+        self.sales = raw_data
+        BREAK
+      CATCH error
+        CALL LOG("Fetch error: " + error.MESSAGE)
+        SLEEP(backoffs[retries])
+        retries = retries + 1
+      ENDTRY
+    ENDLOOP
+  ENDFUNCTION
+
+  FUNCTION is_duplicate(self, sale, seen_keys)
+    LET sale_time = DATE_PARSE(sale.timestamp)
+    LOOP FOR offset IN [-2, -1, 0, 1, 2]
+      LET key = sale.store_id + "|" + sale.product_id + "|" + DATE_FORMAT(DATE_ADD(sale_time, "SECONDS", offset), "YYYY-MM-DDTHH:MM:SS")
+      IF key IN seen_keys THEN
+        RETURN TRUE
+      ENDIF
+    ENDLOOP
+    RETURN FALSE
+  ENDFUNCTION
+
+  FUNCTION clean_and_deduplicate(self)
+    LET seen_keys = {}
+    LOOP FOR s IN self.sales
+      IF NOT (s["store_id"] AND s["product_id"] AND s["timestamp"] AND s["quantity"] AND s["unit_price"]) THEN
+        CONTINUE
+      ENDIF
+
+      IF TYPEOF(s["quantity"]) != "NUMBER" OR s["quantity"] <= 0 THEN
+        CONTINUE
+      ENDIF
+
+      IF s["quantity"] * s["unit_price"] > 10000 THEN
+        self.suspicious_count = self.suspicious_count + 1
+        CONTINUE
+      ENDIF
+
+      LET key_time = DATE_PARSE(s["timestamp"])
+      LET key = s["store_id"] + "|" + s["product_id"] + "|" + DATE_FORMAT(key_time, "YYYY-MM-DDTHH:MM:SS")
+
+      IF CALL self.is_duplicate(s, seen_keys) THEN
+        self.duplicate_count = self.duplicate_count + 1
+        CONTINUE
+      ENDIF
+
+      seen_keys[key] = TRUE
+
+      LET sale = Sale {
+        store_id: s["store_id"],
+        product_id: s["product_id"],
+        timestamp: s["timestamp"],
+        quantity: s["quantity"],
+        unit_price: s["unit_price"]
+      }
+      self.valid_sales.APPEND(sale)
+    ENDLOOP
+  ENDFUNCTION
+
+  FUNCTION summarize_sales(self)
+    LET product_totals = {}
+
+    LOOP FOR sale IN self.valid_sales
+      LET pid = sale.product_id
+      LET amount = sale.quantity * sale.unit_price
+      IF pid IN product_totals THEN
+        product_totals[pid] = product_totals[pid] + amount
+      ELSE
+        product_totals[pid] = amount
+      ENDIF
+    ENDLOOP
+
+    LET sorted = []
+    LOOP FOR pid IN product_totals.KEYS()
+      sorted.APPEND({ "product_id": pid, "amount": product_totals[pid] })
+    ENDLOOP
+
+    sorted.SORT(order = "DESC", key = FUNCTION(x) RETURN x["amount"] ENDFUNCTION)
+
+    PRINT("Top 5 Products by Sales:")
+    LOOP FOR i IN 0 TO MIN(4, LENGTH(sorted) - 1)
+      PRINT(sorted[i]["product_id"] + " : " + TO_STRING(sorted[i]["amount"]))
+    ENDLOOP
+  ENDFUNCTION
+
+  FUNCTION print_metrics(self)
+    PRINT("Valid sales count: " + TO_STRING(LENGTH(self.valid_sales)))
+    PRINT("Duplicates removed: " + TO_STRING(self.duplicate_count))
+    PRINT("Suspicious sales flagged: " + TO_STRING(self.suspicious_count))
+  ENDFUNCTION
+ENDCLASS
+
+LET batch = NEW SaleBatch()
+CALL batch.fetch_sales()
+CALL batch.clean_and_deduplicate()
+CALL batch.summarize_sales()
+CALL batch.print_metrics()

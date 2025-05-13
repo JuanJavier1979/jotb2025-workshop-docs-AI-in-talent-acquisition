@@ -1,0 +1,136 @@
+STRUCT Sale
+  store_id: STRING
+  product_id: STRING
+  timestamp: STRING
+  quantity: NUMBER
+  unit_price: NUMBER
+ENDSTRUCT
+
+FUNCTION fetch_sales_with_retry()
+  LET retries = 0
+  LET backoff_times = [500, 1000, 2000]
+
+  LOOP UNTIL retries == 3
+    TRY
+      LET response = HTTP_GET("https://acme.mock.api/sales")
+      IF LENGTH(response) == 0 THEN
+        RAISE_ERROR("Empty response", "NoData", 204)
+      ENDIF
+      RETURN response
+    CATCH error
+      CALL LOG("Fetch failed: " + error.MESSAGE)
+      IF retries < 3 THEN
+        SLEEP(backoff_times[retries])
+      ENDIF
+      retries = retries + 1
+    ENDTRY
+  ENDLOOP
+
+  RETURN []  # Final fallback if all retries fail
+ENDFUNCTION
+
+FUNCTION is_valid_sale(sale)
+  IF NOT (sale["store_id"] AND sale["product_id"] AND sale["timestamp"] AND sale["quantity"] AND sale["unit_price"]) THEN
+    RETURN FALSE
+  ENDIF
+  IF TYPE(sale["quantity"]) != NUMBER OR sale["quantity"] <= 0 THEN
+    RETURN FALSE
+  ENDIF
+  RETURN TRUE
+ENDFUNCTION
+
+FUNCTION sale_to_key(sale)
+  RETURN sale["store_id"] + "-" + sale["product_id"] + "-" + sale["timestamp"]
+ENDFUNCTION
+
+FUNCTION timestamp_to_seconds(ts)
+  LET parsed = DATE_PARSE(ts)
+  RETURN DATE_DIFF(parsed, DATE_PARSE("1970-01-01T00:00:00Z"), "SECONDS")
+ENDFUNCTION
+
+FUNCTION clean_and_process_sales(raw_sales)
+  LET valid_sales = []
+  LET seen_keys = []
+  LET duplicates_removed = 0
+  LET suspicious_sales = 0
+
+  LOOP FOR sale IN raw_sales
+    IF NOT CALL is_valid_sale(sale) THEN
+      CONTINUE
+    ENDIF
+
+    LET amount = sale["quantity"] * sale["unit_price"]
+    IF amount > 10000 THEN
+      suspicious_sales = suspicious_sales + 1
+      CONTINUE
+    ENDIF
+
+    LET key_time = timestamp_to_seconds(sale["timestamp"])
+    LET is_duplicate = FALSE
+
+    LOOP FOR existing_key IN seen_keys
+      LET parts = existing_key.SPLIT(":::")
+      LET old_key = parts[0]
+      LET old_time = NUMBER(parts[1])
+
+      IF old_key == sale["store_id"] + "-" + sale["product_id"] AND ABS(old_time - key_time) <= 2 THEN
+        is_duplicate = TRUE
+        BREAK
+      ENDIF
+    ENDLOOP
+
+    IF is_duplicate THEN
+      duplicates_removed = duplicates_removed + 1
+      CONTINUE
+    ENDIF
+
+    CALL seen_keys.APPEND(sale["store_id"] + "-" + sale["product_id"] + ":::" + key_time)
+    CALL valid_sales.APPEND(sale)
+  ENDLOOP
+
+  RETURN { "valid_sales": valid_sales, "duplicates_removed": duplicates_removed, "suspicious_sales": suspicious_sales }
+ENDFUNCTION
+
+FUNCTION summarize_sales(valid_sales)
+  LET summary = {}
+
+  LOOP FOR sale IN valid_sales
+    LET pid = sale["product_id"]
+    LET amount = sale["quantity"] * sale["unit_price"]
+    IF summary.CONTAINS(pid) THEN
+      summary[pid] = summary[pid] + amount
+    ELSE
+      summary[pid] = amount
+    ENDIF
+  ENDLOOP
+
+  # Convert to list of tuples for sorting
+  LET tuples = []
+  LOOP FOR key IN summary
+    CALL tuples.APPEND((key, summary[key]))
+  ENDLOOP
+
+  CALL tuples.SORT(order = "DESC")  # Sort by total amount
+  RETURN tuples[0:5]
+ENDFUNCTION
+
+# --------- Main Execution ---------
+
+LET raw_data = CALL fetch_sales_with_retry()
+
+IF LENGTH(raw_data) == 0 THEN
+  PRINT("No data could be processed after retries.")
+  EXIT(1)
+ENDIF
+
+LET cleaned = CALL clean_and_process_sales(raw_data)
+LET top_products = CALL summarize_sales(cleaned["valid_sales"])
+
+PRINT("Top 5 Selling Products:")
+LOOP FOR item IN top_products
+  PRINT(item[0] + " | Total Sales: " + item[1])
+ENDLOOP
+
+PRINT("Valid Sales Count: " + LENGTH(cleaned["valid_sales"]))
+PRINT("Duplicates Removed: " + cleaned["duplicates_removed"])
+PRINT("Suspicious Sales Flagged: " + cleaned["suspicious_sales"])
